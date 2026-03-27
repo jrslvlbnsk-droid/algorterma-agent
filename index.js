@@ -1,6 +1,6 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const Groq = require('groq-sdk');
 
 const app = express();
 app.use(express.json());
@@ -9,8 +9,7 @@ const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
   polling: { interval: 2000, autoStart: true, params: { timeout: 10 } }
 });
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_USER = 'jrslvlbnsk-droid';
@@ -23,7 +22,6 @@ const projects = {
 const projectState = {};
 const conversationHistory = {};
 
-// ─── GITHUB HELPERS ───
 async function getFile(repo, filepath) {
   const url = `https://api.github.com/repos/${GITHUB_USER}/${repo}/contents/${filepath}`;
   const res = await fetch(url, {
@@ -54,7 +52,6 @@ async function updateFile(repo, filepath, newContent, sha, message) {
   return await res.json();
 }
 
-// ─── BOT LOGIKA ───
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
@@ -134,29 +131,23 @@ ZMĚNA: [popis co jsi změnil]
 Pokud se jen ptá nebo chce informace, odpověz normálně bez kódu.
 Odpovídej česky, stručně a přátelsky.`;
 
-    // Sestavení historie pro Gemini
-    const history = conversationHistory[chatId].map(m => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }]
-    }));
-
-    const chat = model.startChat({
-      history: [
-        { role: 'user', parts: [{ text: systemPrompt }] },
-        { role: 'model', parts: [{ text: 'Rozumím, jsem připraven pomoci.' }] },
-        ...history
-      ]
-    });
-
-    const result = await chat.sendMessage(text);
-    const responseText = result.response.text();
-
     conversationHistory[chatId].push({ role: 'user', content: text });
-    conversationHistory[chatId].push({ role: 'assistant', content: responseText });
-
     if (conversationHistory[chatId].length > 20) {
       conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
     }
+
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      max_tokens: 16000,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        ...conversationHistory[chatId]
+      ]
+    });
+
+    const responseText = response.choices[0].message.content;
+
+    conversationHistory[chatId].push({ role: 'assistant', content: responseText });
 
     if (responseText.includes('===KOD_START===') && responseText.includes('===KOD_END===')) {
       const kodMatch = responseText.match(/===KOD_START===\n?([\s\S]*?)\n?===KOD_END===/);
