@@ -54,7 +54,7 @@ async function updateFile(repo, filepath, newContent, sha, message) {
 
 async function callGroq(systemPrompt, history) {
   for (const limit of [20000, 12000, 6000]) {
-    const truncated = systemPrompt.replace(/AKTUÁLNÍ OBSAH SOUBORU:\n[\s\S]*/, 
+    const truncated = systemPrompt.replace(/AKTUÁLNÍ OBSAH SOUBORU:\n[\s\S]*/,
       `AKTUÁLNÍ OBSAH SOUBORU:\n${systemPrompt.match(/AKTUÁLNÍ OBSAH SOUBORU:\n([\s\S]*)/)?.[1]?.substring(0, limit) || ''}`
     );
     try {
@@ -72,6 +72,18 @@ async function callGroq(systemPrompt, history) {
       throw e;
     }
   }
+}
+
+function extractCode(responseText) {
+  // Zkus přesný formát ===KOD_START===
+  let match = responseText.match(/===KOD_START===\n?([\s\S]*?)\n?===KOD_END===/);
+  if (match) return match[1].trim();
+
+  // Fallback: zkus markdown ```html nebo ```
+  match = responseText.match(/```(?:html)?\n?([\s\S]*?)\n?```/);
+  if (match) return match[1].trim();
+
+  return null;
 }
 
 bot.on('message', async (msg) => {
@@ -143,13 +155,14 @@ ${fileContent}
 
 Pokud tě uživatel požádá o úpravu webu:
 1. Uprav HTML kód podle požadavku
-2. Vrať odpověď PŘESNĚ v tomto formátu:
+2. Vrať odpověď PŘESNĚ v tomto formátu (bez markdown bloků, bez backticks):
 
 ZMĚNA: [popis co jsi změnil]
 ===KOD_START===
 [celý upravený kód]
 ===KOD_END===
 
+DŮLEŽITÉ: Nepoužívej markdown bloky ani backticks. Použij POUZE značky ===KOD_START=== a ===KOD_END===.
 Pokud se jen ptá nebo chce informace, odpověz normálně bez kódu.
 Odpovídej česky, stručně a přátelsky.`;
 
@@ -159,15 +172,16 @@ Odpovídej česky, stručně a přátelsky.`;
     }
 
     const responseText = await callGroq(systemPrompt, conversationHistory[chatId]);
-
     conversationHistory[chatId].push({ role: 'assistant', content: responseText });
 
-    if (responseText.includes('===KOD_START===') && responseText.includes('===KOD_END===')) {
-      const kodMatch = responseText.match(/===KOD_START===\n?([\s\S]*?)\n?===KOD_END===/);
+    const hasKodMarkers = responseText.includes('===KOD_START===') && responseText.includes('===KOD_END===');
+    const hasMarkdown = responseText.includes('```');
+    
+    if (hasKodMarkers || hasMarkdown) {
+      const novyKod = extractCode(responseText);
       const zmenaMatch = responseText.match(/ZMĚNA: (.+)/);
 
-      if (kodMatch) {
-        const novyKod = kodMatch[1];
+      if (novyKod) {
         const popis = zmenaMatch ? zmenaMatch[1] : 'Aktualizace přes agenta';
         await updateFile(p.repo, p.file, novyKod, fileSha, popis);
         bot.sendMessage(chatId,
