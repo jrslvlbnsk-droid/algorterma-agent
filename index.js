@@ -9,7 +9,7 @@ const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
   polling: { interval: 2000, autoStart: true, params: { timeout: 10 } }
 });
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY, timeout: 30000 });
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_USER = 'jrslvlbnsk-droid';
@@ -75,14 +75,10 @@ async function callGroq(systemPrompt, history) {
 }
 
 function extractCode(responseText) {
-  // Zkus přesný formát ===KOD_START===
   let match = responseText.match(/===KOD_START===\n?([\s\S]*?)\n?===KOD_END===/);
   if (match) return match[1].trim();
-
-  // Fallback: zkus markdown ```html nebo ```
   match = responseText.match(/```(?:html)?\n?([\s\S]*?)\n?```/);
   if (match) return match[1].trim();
-
   return null;
 }
 
@@ -176,7 +172,7 @@ Odpovídej česky, stručně a přátelsky.`;
 
     const hasKodMarkers = responseText.includes('===KOD_START===') && responseText.includes('===KOD_END===');
     const hasMarkdown = responseText.includes('```');
-    
+
     if (hasKodMarkers || hasMarkdown) {
       const novyKod = extractCode(responseText);
       const zmenaMatch = responseText.match(/ZMĚNA: (.+)/);
