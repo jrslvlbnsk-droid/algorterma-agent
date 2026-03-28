@@ -21,7 +21,6 @@ const projects = {
 
 const projectState = {};
 const conversationHistory = {};
-const pendingChange = {};
 
 async function getFile(repo, filepath) {
   const url = `https://api.github.com/repos/${GITHUB_USER}/${repo}/contents/${filepath}`;
@@ -74,44 +73,25 @@ async function getFileAtCommit(repo, filepath, sha) {
   return Buffer.from(data.content, 'base64').toString('utf-8');
 }
 
-async function callGroq(systemPrompt, history) {
-  for (const limit of [20000, 12000, 6000]) {
-    const truncated = systemPrompt.replace(/AKTUÁLNÍ OBSAH SOUBORU:\n[\s\S]*/,
-      `AKTUÁLNÍ OBSAH SOUBORU:\n${systemPrompt.match(/AKTUÁLNÍ OBSAH SOUBORU:\n([\s\S]*)/)?.[1]?.substring(0, limit) || ''}`
-    );
-    try {
-      const response = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        max_tokens: 8000,
-        messages: [{ role: 'system', content: truncated }, ...history]
-      });
-      return response.choices[0].message.content;
-    } catch (e) {
-      if ((e.status === 413 || e.status === 429) && limit > 6000) continue;
-      throw e;
-    }
-  }
+async function callGroq(messages) {
+  const response = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    max_tokens: 4000,
+    messages
+  });
+  return response.choices[0].message.content;
 }
 
-function extractCode(responseText) {
-  let match = responseText.match(/===KOD_START===\n?([\s\S]*?)\n?===KOD_END===/);
-  if (match) return match[1].trim();
-  match = responseText.match(/```(?:html)?\n?([\s\S]*?)\n?```/);
-  if (match) return match[1].trim();
-  return null;
-}
+function applyPatch(original, patch) {
+  const findMatch = patch.match(/NAJDI:\n([\s\S]*?)\nNAHRAD:\n([\s\S]*?)(\nKONEC|$)/);
+  if (!findMatch) return null;
 
-function simpleDiff(oldText, newText) {
-  const oldLines = oldText.split('\n');
-  const newLines = newText.split('\n');
-  const removed = oldLines.filter(l => !newLines.includes(l)).length;
-  const added = newLines.filter(l => !oldLines.includes(l)).length;
-  return `➕ Přidáno řádků: ${added}\n➖ Odebráno řádků: ${removed}\n📄 Celkem řádků: ${newLines.length}`;
-}
+  const find = findMatch[1].trim();
+  const replace = findMatch[2].trim();
 
-function wantsPreview(text) {
-  const keywords = ['náhled', 'preview', 'ukaž', 'zobraz', 'zkontroluj před', 'před uložením'];
-  return keywords.some(k => text.toLowerCase().includes(k));
+  if (!original.includes(find)) return null;
+
+  return original.replace(find, replace);
 }
 
 bot.on('message', async (msg) => {
@@ -130,17 +110,10 @@ bot.on('message', async (msg) => {
       '/algorterma — AlgorTerma\n' +
       '/neumimplavat — Neumimplavat\n' +
       '/projekt — aktuální projekt\n\n' +
-      '📂 *Soubory:*\n' +
-      '/soubor index.html — přepnout soubor\n' +
-      '/soubory — seznam souborů v repozitáři\n\n' +
       '🕐 *Historie:*\n' +
       '/history — posledních 5 commitů\n' +
       '/revert abc123 — vrátit soubor na commit\n\n' +
-      '✅ *Čekající změny:*\n' +
-      '/potvrdit — uložit čekající změnu\n' +
-      '/nahled — zobrazit náhled čekající změny\n' +
-      '/zrusit — zrušit čekající změnu\n\n' +
-      'Tip: Přidej "náhled" nebo "ukaž před uložením" do zprávy pro náhled změn.',
+      'Prostě mi napiš co chceš změnit!',
       { parse_mode: 'Markdown' }
     );
     return;
@@ -149,41 +122,19 @@ bot.on('message', async (msg) => {
   if (text === '/algorterma') {
     projectState[chatId] = 'algorterma';
     conversationHistory[chatId] = [];
-    delete pendingChange[chatId];
-    bot.sendMessage(chatId, '✅ Přepnuto na projekt *AlgorTerma*', { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, '✅ Přepnuto na *AlgorTerma*', { parse_mode: 'Markdown' });
     return;
   }
 
   if (text === '/neumimplavat') {
     projectState[chatId] = 'neumimplavat';
     conversationHistory[chatId] = [];
-    delete pendingChange[chatId];
-    bot.sendMessage(chatId, '✅ Přepnuto na projekt *Neumimplavat*', { parse_mode: 'Markdown' });
+    bot.sendMessage(chatId, '✅ Přepnuto na *Neumimplavat*', { parse_mode: 'Markdown' });
     return;
   }
 
   if (text === '/projekt') {
     bot.sendMessage(chatId, `📁 Projekt: *${p.name}* (${p.url})\n📄 Soubor: \`${p.file}\``, { parse_mode: 'Markdown' });
-    return;
-  }
-
-  if (text.startsWith('/soubor ')) {
-    const filename = text.replace('/soubor ', '').trim();
-    projects[currentProject].file = filename;
-    bot.sendMessage(chatId, `📄 Soubor přepnut na: \`${filename}\``, { parse_mode: 'Markdown' });
-    return;
-  }
-
-  if (text === '/soubory') {
-    try {
-      const url = `https://api.github.com/repos/${GITHUB_USER}/${p.repo}/contents/`;
-      const res = await fetch(url, { headers: { Authorization: `token ${GITHUB_TOKEN}` } });
-      const files = await res.json();
-      const list = files.filter(f => f.type === 'file').map(f => `• \`${f.name}\``).join('\n');
-      bot.sendMessage(chatId, `📂 Soubory v repozitáři *${p.name}*:\n${list}`, { parse_mode: 'Markdown' });
-    } catch (e) {
-      bot.sendMessage(chatId, `❌ Nelze načíst soubory: ${e.message}`);
-    }
     return;
   }
 
@@ -199,7 +150,7 @@ bot.on('message', async (msg) => {
         { parse_mode: 'Markdown' }
       );
     } catch (e) {
-      bot.sendMessage(chatId, `❌ Chyba při načítání historie: ${e.message}`);
+      bot.sendMessage(chatId, `❌ Chyba: ${e.message}`);
     }
     return;
   }
@@ -207,62 +158,14 @@ bot.on('message', async (msg) => {
   if (text.startsWith('/revert ')) {
     const hash = text.replace('/revert ', '').trim();
     try {
-      bot.sendMessage(chatId, `⏳ Načítám verzi \`${hash}\`...`, { parse_mode: 'Markdown' });
+      bot.sendMessage(chatId, `⏳ Vracím na verzi \`${hash}\`...`, { parse_mode: 'Markdown' });
       const oldContent = await getFileAtCommit(p.repo, p.file, hash);
       const current = await getFile(p.repo, p.file);
-      const diff = simpleDiff(current.content, oldContent);
-      pendingChange[chatId] = { newContent: oldContent, sha: current.sha, popis: `Revert na ${hash}` };
-      bot.sendMessage(chatId,
-        `📋 *Náhled revertu na \`${hash}\`*\n\n${diff}\n\nPotvrdit? /potvrdit nebo /zrusit`,
-        { parse_mode: 'Markdown' }
-      );
+      await updateFile(p.repo, p.file, oldContent, current.sha, `Revert na ${hash}`);
+      bot.sendMessage(chatId, `✅ Vráceno na verzi \`${hash}\``, { parse_mode: 'Markdown' });
     } catch (e) {
       bot.sendMessage(chatId, `❌ Chyba při revertu: ${e.message}`);
     }
-    return;
-  }
-
-  if (text === '/nahled') {
-    const pending = pendingChange[chatId];
-    if (!pending) {
-      bot.sendMessage(chatId, '⚠️ Žádná čekající změna.');
-      return;
-    }
-    try {
-      const current = await getFile(p.repo, p.file);
-      const diff = simpleDiff(current.content, pending.newContent);
-      bot.sendMessage(chatId,
-        `📋 *Náhled čekající změny:*\n\n📝 ${pending.popis}\n\n${diff}\n\n/potvrdit nebo /zrusit`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (e) {
-      bot.sendMessage(chatId, `❌ Chyba: ${e.message}`);
-    }
-    return;
-  }
-
-  if (text === '/potvrdit') {
-    const pending = pendingChange[chatId];
-    if (!pending) {
-      bot.sendMessage(chatId, '⚠️ Žádná čekající změna.');
-      return;
-    }
-    try {
-      await updateFile(p.repo, p.file, pending.newContent, pending.sha, pending.popis);
-      delete pendingChange[chatId];
-      bot.sendMessage(chatId,
-        `✅ *Hotovo!*\n\n📝 ${pending.popis}\n\n🚀 Změny jsou na GitHubu, Railway nasazuje...`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (e) {
-      bot.sendMessage(chatId, `❌ Chyba při ukládání: ${e.message}`);
-    }
-    return;
-  }
-
-  if (text === '/zrusit') {
-    delete pendingChange[chatId];
-    bot.sendMessage(chatId, '🚫 Změna zrušena.');
     return;
   }
 
@@ -271,70 +174,61 @@ bot.on('message', async (msg) => {
   bot.sendMessage(chatId, `⏳ Pracuji na tom... (${p.name})`);
 
   try {
-    let fileContent = '';
-    let fileSha = null;
+    const { content: fileContent, sha: fileSha } = await getFile(p.repo, p.file);
 
-    try {
-      const fileData = await getFile(p.repo, p.file);
-      fileContent = fileData.content;
-      fileSha = fileData.sha;
-    } catch (e) {
-      bot.sendMessage(chatId, `⚠️ Nepodařilo se načíst soubor:\n${e.message}`);
-      return;
-    }
+    // Krok 1: Groq identifikuje co změnit (bez celého souboru)
+    const snippet = fileContent.substring(0, 8000);
+    const snippetEnd = fileContent.length > 8000 ? fileContent.substring(fileContent.length - 2000) : '';
 
-    const systemPrompt = `Jsi AI agent spravující web ${p.name} (${p.url}). Pracuješ se souborem ${p.file} v repozitáři ${p.repo}.
+    const systemPrompt = `Jsi expert na HTML/CSS. Uživatel chce upravit webovou stránku.
+Dostaneš začátek a konec souboru jako kontext. Tvým úkolem je vrátit PŘESNĚ tento formát:
 
-AKTUÁLNÍ OBSAH SOUBORU:
-${fileContent}
+POPIS: [co jsi změnil, česky]
+NAJDI:
+[přesný text z originálního souboru který má být nahrazen - musí být unikátní úsek]
+NAHRAD:
+[nový text který ho nahradí]
+KONEC
 
-Pokud tě uživatel požádá o úpravu webu:
-1. Uprav HTML kód podle požadavku
-2. Vrať odpověď PŘESNĚ v tomto formátu (bez markdown bloků, bez backticks):
-
-ZMĚNA: [popis co jsi změnil]
-===KOD_START===
-[celý upravený kód]
-===KOD_END===
-
-DŮLEŽITÉ: Nepoužívej markdown bloky ani backticks. Použij POUZE značky ===KOD_START=== a ===KOD_END===.
-Pokud se jen ptá nebo chce informace, odpověz normálně bez kódu.
-Odpovídej česky, stručně a přátelsky.`;
+PRAVIDLA:
+- Text v NAJDI musí být přesná kopie z originálního souboru včetně mezer a odsazení
+- Změň jen to co uživatel žádá, nic jiného
+- Pokud je změna čistě textová (název, barva, text), najdi přesně ten element
+- Nepiš nic jiného než výše uvedený formát
+- Pokud to není úprava kódu ale otázka, odpověz normálně česky BEZ formátu NAJDI/NAHRAD`;
 
     conversationHistory[chatId].push({ role: 'user', content: text });
-    if (conversationHistory[chatId].length > 20) {
-      conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
+    if (conversationHistory[chatId].length > 10) {
+      conversationHistory[chatId] = conversationHistory[chatId].slice(-10);
     }
 
-    const responseText = await callGroq(systemPrompt, conversationHistory[chatId]);
+    const contextMsg = `Začátek souboru:\n${snippet}\n\n${snippetEnd ? `Konec souboru:\n${snippetEnd}` : ''}`;
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: `Obsah souboru:\n${contextMsg}` },
+      { role: 'assistant', content: 'Rozumím obsahu souboru.' },
+      ...conversationHistory[chatId]
+    ];
+
+    const responseText = await callGroq(messages);
     conversationHistory[chatId].push({ role: 'assistant', content: responseText });
 
-    const hasKodMarkers = responseText.includes('===KOD_START===') && responseText.includes('===KOD_END===');
-    const hasMarkdown = responseText.includes('```');
+    if (responseText.includes('NAJDI:') && responseText.includes('NAHRAD:')) {
+      const patchedContent = applyPatch(fileContent, responseText);
+      const popisMatch = responseText.match(/POPIS: (.+)/);
+      const popis = popisMatch ? popisMatch[1] : 'Úprava webu';
 
-    if (hasKodMarkers || hasMarkdown) {
-      const novyKod = extractCode(responseText);
-      const zmenaMatch = responseText.match(/ZMĚNA: (.+)/);
-
-      if (novyKod) {
-        const popis = zmenaMatch ? zmenaMatch[1] : 'Aktualizace přes agenta';
-
-        if (wantsPreview(text)) {
-          const diff = simpleDiff(fileContent, novyKod);
-          pendingChange[chatId] = { newContent: novyKod, sha: fileSha, popis };
-          bot.sendMessage(chatId,
-            `📋 *Náhled změn:*\n\n📝 ${popis}\n\n${diff}\n\nUložit? /potvrdit nebo /zrusit`,
-            { parse_mode: 'Markdown' }
-          );
-        } else {
-          await updateFile(p.repo, p.file, novyKod, fileSha, popis);
-          bot.sendMessage(chatId,
-            `✅ *Hotovo!*\n\n📝 ${popis}\n\n🚀 Změny jsou na GitHubu, Railway nasazuje...`,
-            { parse_mode: 'Markdown' }
-          );
-        }
+      if (patchedContent) {
+        await updateFile(p.repo, p.file, patchedContent, fileSha, popis);
+        bot.sendMessage(chatId,
+          `✅ *Hotovo!*\n\n📝 ${popis}\n\n🚀 Změny jsou na GitHubu, Railway nasazuje...`,
+          { parse_mode: 'Markdown' }
+        );
       } else {
-        bot.sendMessage(chatId, '⚠️ Kód se nepodařilo extrahovat. Zkus přeformulovat požadavek.');
+        bot.sendMessage(chatId,
+          `⚠️ Nepodařilo se najít text k nahrazení v souboru.\n\nZkus být konkrétnější — napiš přesně který text nebo sekci chceš změnit.`
+        );
       }
     } else {
       bot.sendMessage(chatId, responseText.substring(0, 4000));
@@ -344,7 +238,7 @@ Odpovídej česky, stručně a přátelsky.`;
     console.error(err);
     let errMsg = err.message || 'Neznámá chyba';
     if (err.status === 429) errMsg = 'Překročen limit Groq API. Zkus za chvíli.';
-    if (err.status === 413) errMsg = 'Soubor je příliš velký pro zpracování.';
+    if (err.status === 413) errMsg = 'Požadavek příliš velký.';
     if (err.status === 401) errMsg = 'Chybná autorizace — zkontroluj API klíče.';
     bot.sendMessage(chatId, `❌ Chyba: ${errMsg}`);
   }
