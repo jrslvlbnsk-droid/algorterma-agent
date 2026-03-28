@@ -52,6 +52,28 @@ async function updateFile(repo, filepath, newContent, sha, message) {
   return await res.json();
 }
 
+async function callGroq(systemPrompt, history) {
+  for (const limit of [20000, 12000, 6000]) {
+    const truncated = systemPrompt.replace(/AKTUÁLNÍ OBSAH SOUBORU:\n[\s\S]*/, 
+      `AKTUÁLNÍ OBSAH SOUBORU:\n${systemPrompt.match(/AKTUÁLNÍ OBSAH SOUBORU:\n([\s\S]*)/)?.[1]?.substring(0, limit) || ''}`
+    );
+    try {
+      const response = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        max_tokens: 8000,
+        messages: [
+          { role: 'system', content: truncated },
+          ...history
+        ]
+      });
+      return response.choices[0].message.content;
+    } catch (e) {
+      if ((e.status === 413 || e.status === 429) && limit > 6000) continue;
+      throw e;
+    }
+  }
+}
+
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
@@ -117,7 +139,7 @@ bot.on('message', async (msg) => {
     const systemPrompt = `Jsi AI agent spravující web ${p.name} (${p.url}). Máš přístup k souboru ${p.file} v GitHub repozitáři ${p.repo}.
 
 AKTUÁLNÍ OBSAH SOUBORU:
-${fileContent.substring(0, 30000)}
+${fileContent}
 
 Pokud tě uživatel požádá o úpravu webu:
 1. Uprav HTML kód podle požadavku
@@ -136,16 +158,7 @@ Odpovídej česky, stručně a přátelsky.`;
       conversationHistory[chatId] = conversationHistory[chatId].slice(-20);
     }
 
-    const response = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      max_tokens: 16000,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        ...conversationHistory[chatId]
-      ]
-    });
-
-    const responseText = response.choices[0].message.content;
+    const responseText = await callGroq(systemPrompt, conversationHistory[chatId]);
 
     conversationHistory[chatId].push({ role: 'assistant', content: responseText });
 
