@@ -79,6 +79,81 @@ function applyPatch(original, patch) {
   return original.replace(find, replace);
 }
 
+async function callClaude(systemPrompt, history) {
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 16000,
+    system: systemPrompt,
+    messages: history
+  });
+  return response.content[0].text;
+}
+
+async function processEdit(chatId, p, fileContent, fileSha, userRequest, retryContext = '') {
+  const systemPrompt = `Jsi AI agent spravující web ${p.name} (${p.url}). Pracuješ se souborem ${p.file}.
+
+PRAVIDLA:
+- Měň POUZE to co uživatel žádá, nic jiného
+- Vždy vrať přesný patch ve formátu níže
+- Text v NAJDI musí být PŘESNÁ kopie z originálního souboru včetně mezer a odsazení
+- Pokud je změna komplexní, rozděl ji na více NAJDI/NAHRAD bloků za sebou
+- NIKDY nevracej celý soubor, pouze změny
+
+${retryContext ? `PŘEDCHOZÍ POKUS SELHAL: ${retryContext}\nZkus najít přesnější text.` : ''}
+
+Pro úpravy vrať PŘESNĚ:
+
+POPIS: [stručný popis změny]
+NAJDI:
+[přesný text z originálního souboru]
+NAHRAD:
+[nový text]
+KONEC
+
+Pro více změn najednou:
+POPIS: [popis]
+NAJDI:
+[první úsek]
+NAHRAD:
+[nová verze]
+KONEC
+NAJDI:
+[druhý úsek]
+NAHRAD:
+[nová verze]
+KONEC
+
+Pro otázky nebo informace odpověz normálně BEZ formátu NAJDI/NAHRAD.
+Odpovídej česky.
+
+AKTUÁLNÍ OBSAH SOUBORU ${p.file}:
+${fileContent}`;
+
+  const history = [{ role: 'user', content: userRequest }];
+  return await callClaude(systemPrompt, history);
+}
+
+function applyAllPatches(original, responseText) {
+  const patchRegex = /NAJDI:\n([\s\S]*?)\nNAHRAD:\n([\s\S]*?)\nKONEC/g;
+  let result = original;
+  let match;
+  let appliedCount = 0;
+  let failedPatches = [];
+
+  while ((match = patchRegex.exec(responseText)) !== null) {
+    const find = match[1].trim();
+    const replace = match[2].trim();
+    if (result.includes(find)) {
+      result = result.replace(find, replace);
+      appliedCount++;
+    } else {
+      failedPatches.push(find.substring(0, 50) + '...');
+    }
+  }
+
+  return { result, appliedCount, failedPatches };
+}
+
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
@@ -90,7 +165,7 @@ bot.on('message', async (msg) => {
 
   if (text === '/start' || text === '/help') {
     bot.sendMessage(chatId,
-      '👋 Jsem tvůj AI agent!\n\n' +
+      '👋 Jsem tvůj AI agent s Claude!\n\n' +
       '📁 *Projekty:*\n' +
       '/algorterma — AlgorTerma\n' +
       '/neumimplavat — Neumimplavat\n' +
@@ -156,51 +231,37 @@ bot.on('message', async (msg) => {
   try {
     const { content: fileContent, sha: fileSha } = await getFile(p.repo, p.file);
 
-    conversationHistory[chatId].push({ role: 'user', content: text });
-    if (conversationHistory[chatId].length > 10) {
-      conversationHistory[chatId] = conversationHistory[chatId].slice(-10);
-    }
-
-    const systemPrompt = `Jsi AI agent spravující web ${p.name} (${p.url}). Pracuješ se souborem ${p.file}.
-
-AKTUÁLNÍ OBSAH SOUBORU:
-${fileContent}
-
-Pokud tě uživatel požádá o úpravu, vrať PŘESNĚ tento formát:
-
-POPIS: [co jsi změnil]
-NAJDI:
-[přesný text z originálního souboru včetně odsazení]
-NAHRAD:
-[nový text]
-KONEC
-
-Měň POUZE to co uživatel žádá. Pro otázky odpověz normálně BEZ tohoto formátu.
-Odpovídej česky.`;
-
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 8000,
-      system: systemPrompt,
-      messages: conversationHistory[chatId]
-    });
-
-    const responseText = response.content[0].text;
-    conversationHistory[chatId].push({ role: 'assistant', content: responseText });
+    // První pokus
+    let responseText = await processEdit(chatId, p, fileContent, fileSha, text);
 
     if (responseText.includes('NAJDI:') && responseText.includes('NAHRAD:')) {
-      const patched = applyPatch(fileContent, responseText);
+      const { result, appliedCount, failedPatches } = applyAllPatches(fileContent, responseText);
       const popisMatch = responseText.match(/POPIS: (.+)/);
       const popis = popisMatch ? popisMatch[1] : 'Úprava webu';
 
-      if (patched) {
-        await updateFile(p.repo, p.file, patched, fileSha, popis);
-        bot.sendMessage(chatId,
-          `✅ *Hotovo!*\n\n📝 ${popis}\n\n🚀 Změny jsou na GitHubu, Railway nasazuje...`,
-          { parse_mode: 'Markdown' }
-        );
+      if (appliedCount > 0) {
+        await updateFile(p.repo, p.file, result, fileSha, popis);
+        const msg = failedPatches.length > 0
+          ? `✅ *Hotovo!*\n\n📝 ${popis}\n⚠️ ${failedPatches.length} změn se nepodařilo aplikovat\n\n🚀 Na GitHubu, Railway nasazuje...`
+          : `✅ *Hotovo!*\n\n📝 ${popis}\n\n🚀 Na GitHubu, Railway nasazuje...`;
+        bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
       } else {
-        bot.sendMessage(chatId, '⚠️ Nepodařilo se najít text k nahrazení. Zkus být konkrétnější.');
+        // Retry — patch selhal, zkusíme znovu s kontextem
+        bot.sendMessage(chatId, '🔄 Upřesňuji vyhledávání...');
+        responseText = await processEdit(chatId, p, fileContent, fileSha, text, 'Text k nahrazení nebyl nalezen v souboru. Použij kratší a přesnější úsek textu.');
+
+        if (responseText.includes('NAJDI:') && responseText.includes('NAHRAD:')) {
+          const retry = applyAllPatches(fileContent, responseText);
+          if (retry.appliedCount > 0) {
+            const popis2 = responseText.match(/POPIS: (.+)/)?.[1] || 'Úprava webu';
+            await updateFile(p.repo, p.file, retry.result, fileSha, popis2);
+            bot.sendMessage(chatId, `✅ *Hotovo!*\n\n📝 ${popis2}\n\n🚀 Na GitHubu, Railway nasazuje...`, { parse_mode: 'Markdown' });
+          } else {
+            bot.sendMessage(chatId, '⚠️ Nepodařilo se aplikovat změny. Zkus být konkrétnější — napiš přesně který element nebo text chceš změnit.');
+          }
+        } else {
+          bot.sendMessage(chatId, responseText.substring(0, 4000));
+        }
       }
     } else {
       bot.sendMessage(chatId, responseText.substring(0, 4000));
@@ -210,7 +271,7 @@ Odpovídej česky.`;
     console.error(err);
     let errMsg = err.message || 'Neznámá chyba';
     if (err.status === 429) errMsg = 'Překročen limit API. Zkus za chvíli.';
-    if (err.status === 401) errMsg = 'Chybný API klíč.';
+    if (err.status === 401) errMsg = 'Chybný API klíč — zkontroluj ANTHROPIC_API_KEY v Railway.';
     bot.sendMessage(chatId, `❌ Chyba: ${errMsg}`);
   }
 });
