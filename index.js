@@ -1,6 +1,6 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
-const Groq = require('groq-sdk');
+const Anthropic = require('@anthropic-ai/sdk').default;
 
 const app = express();
 app.use(express.json());
@@ -9,7 +9,7 @@ const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
   polling: { interval: 2000, autoStart: true, params: { timeout: 10 } }
 });
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY, timeout: 30000 });
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_USER = 'jrslvlbnsk-droid';
@@ -47,10 +47,7 @@ async function updateFile(repo, filepath, newContent, sha, message) {
       sha
     })
   });
-  if (!res.ok) {
-    const err = await res.json();
-    throw new Error(`GitHub chyba: ${err.message}`);
-  }
+  if (!res.ok) { const err = await res.json(); throw new Error(`GitHub chyba: ${err.message}`); }
   return await res.json();
 }
 
@@ -73,24 +70,12 @@ async function getFileAtCommit(repo, filepath, sha) {
   return Buffer.from(data.content, 'base64').toString('utf-8');
 }
 
-async function callGroq(messages) {
-  const response = await groq.chat.completions.create({
-    model: 'llama-3.3-70b-versatile',
-    max_tokens: 4000,
-    messages
-  });
-  return response.choices[0].message.content;
-}
-
 function applyPatch(original, patch) {
-  const findMatch = patch.match(/NAJDI:\n([\s\S]*?)\nNAHRAD:\n([\s\S]*?)(\nKONEC|$)/);
-  if (!findMatch) return null;
-
-  const find = findMatch[1].trim();
-  const replace = findMatch[2].trim();
-
+  const m = patch.match(/NAJDI:\n([\s\S]*?)\nNAHRAD:\n([\s\S]*?)(\nKONEC|$)/);
+  if (!m) return null;
+  const find = m[1].trim();
+  const replace = m[2].trim();
   if (!original.includes(find)) return null;
-
   return original.replace(find, replace);
 }
 
@@ -113,7 +98,7 @@ bot.on('message', async (msg) => {
       '🕐 *Historie:*\n' +
       '/history — posledních 5 commitů\n' +
       '/revert abc123 — vrátit soubor na commit\n\n' +
-      'Prostě mi napiš co chceš změnit!',
+      'Prostě mi napiš co chceš upravit!',
       { parse_mode: 'Markdown' }
     );
     return;
@@ -145,10 +130,7 @@ bot.on('message', async (msg) => {
       const list = commits.map((c, i) =>
         `${i + 1}. \`${c.sha.substring(0, 7)}\` — ${c.commit.message}\n    📅 ${new Date(c.commit.author.date).toLocaleString('cs-CZ')}`
       ).join('\n\n');
-      bot.sendMessage(chatId,
-        `🕐 *Historie: ${p.file}*\n\n${list}\n\nPro vrácení: /revert [hash]`,
-        { parse_mode: 'Markdown' }
-      );
+      bot.sendMessage(chatId, `🕐 *Historie: ${p.file}*\n\n${list}\n\nPro vrácení: /revert [hash]`, { parse_mode: 'Markdown' });
     } catch (e) {
       bot.sendMessage(chatId, `❌ Chyba: ${e.message}`);
     }
@@ -169,66 +151,56 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // ── AI požadavek ──
-
   bot.sendMessage(chatId, `⏳ Pracuji na tom... (${p.name})`);
 
   try {
     const { content: fileContent, sha: fileSha } = await getFile(p.repo, p.file);
-
-    // Krok 1: Groq identifikuje co změnit (bez celého souboru)
-    const snippet = fileContent.substring(0, 8000);
-    const snippetEnd = fileContent.length > 8000 ? fileContent.substring(fileContent.length - 2000) : '';
-
-    const systemPrompt = `Jsi expert na HTML/CSS. Uživatel chce upravit webovou stránku.
-Dostaneš začátek a konec souboru jako kontext. Tvým úkolem je vrátit PŘESNĚ tento formát:
-
-POPIS: [co jsi změnil, česky]
-NAJDI:
-[přesný text z originálního souboru který má být nahrazen - musí být unikátní úsek]
-NAHRAD:
-[nový text který ho nahradí]
-KONEC
-
-PRAVIDLA:
-- Text v NAJDI musí být přesná kopie z originálního souboru včetně mezer a odsazení
-- Změň jen to co uživatel žádá, nic jiného
-- Pokud je změna čistě textová (název, barva, text), najdi přesně ten element
-- Nepiš nic jiného než výše uvedený formát
-- Pokud to není úprava kódu ale otázka, odpověz normálně česky BEZ formátu NAJDI/NAHRAD`;
 
     conversationHistory[chatId].push({ role: 'user', content: text });
     if (conversationHistory[chatId].length > 10) {
       conversationHistory[chatId] = conversationHistory[chatId].slice(-10);
     }
 
-    const contextMsg = `Začátek souboru:\n${snippet}\n\n${snippetEnd ? `Konec souboru:\n${snippetEnd}` : ''}`;
+    const systemPrompt = `Jsi AI agent spravující web ${p.name} (${p.url}). Pracuješ se souborem ${p.file}.
 
-    const messages = [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: `Obsah souboru:\n${contextMsg}` },
-      { role: 'assistant', content: 'Rozumím obsahu souboru.' },
-      ...conversationHistory[chatId]
-    ];
+AKTUÁLNÍ OBSAH SOUBORU:
+${fileContent}
 
-    const responseText = await callGroq(messages);
+Pokud tě uživatel požádá o úpravu, vrať PŘESNĚ tento formát:
+
+POPIS: [co jsi změnil]
+NAJDI:
+[přesný text z originálního souboru včetně odsazení]
+NAHRAD:
+[nový text]
+KONEC
+
+Měň POUZE to co uživatel žádá. Pro otázky odpověz normálně BEZ tohoto formátu.
+Odpovídej česky.`;
+
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 8000,
+      system: systemPrompt,
+      messages: conversationHistory[chatId]
+    });
+
+    const responseText = response.content[0].text;
     conversationHistory[chatId].push({ role: 'assistant', content: responseText });
 
     if (responseText.includes('NAJDI:') && responseText.includes('NAHRAD:')) {
-      const patchedContent = applyPatch(fileContent, responseText);
+      const patched = applyPatch(fileContent, responseText);
       const popisMatch = responseText.match(/POPIS: (.+)/);
       const popis = popisMatch ? popisMatch[1] : 'Úprava webu';
 
-      if (patchedContent) {
-        await updateFile(p.repo, p.file, patchedContent, fileSha, popis);
+      if (patched) {
+        await updateFile(p.repo, p.file, patched, fileSha, popis);
         bot.sendMessage(chatId,
           `✅ *Hotovo!*\n\n📝 ${popis}\n\n🚀 Změny jsou na GitHubu, Railway nasazuje...`,
           { parse_mode: 'Markdown' }
         );
       } else {
-        bot.sendMessage(chatId,
-          `⚠️ Nepodařilo se najít text k nahrazení v souboru.\n\nZkus být konkrétnější — napiš přesně který text nebo sekci chceš změnit.`
-        );
+        bot.sendMessage(chatId, '⚠️ Nepodařilo se najít text k nahrazení. Zkus být konkrétnější.');
       }
     } else {
       bot.sendMessage(chatId, responseText.substring(0, 4000));
@@ -237,9 +209,8 @@ PRAVIDLA:
   } catch (err) {
     console.error(err);
     let errMsg = err.message || 'Neznámá chyba';
-    if (err.status === 429) errMsg = 'Překročen limit Groq API. Zkus za chvíli.';
-    if (err.status === 413) errMsg = 'Požadavek příliš velký.';
-    if (err.status === 401) errMsg = 'Chybná autorizace — zkontroluj API klíče.';
+    if (err.status === 429) errMsg = 'Překročen limit API. Zkus za chvíli.';
+    if (err.status === 401) errMsg = 'Chybný API klíč.';
     bot.sendMessage(chatId, `❌ Chyba: ${errMsg}`);
   }
 });

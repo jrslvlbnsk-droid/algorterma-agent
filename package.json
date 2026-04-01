@@ -10,6 +10,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.81.0",
     "@google/generative-ai": "^0.24.1",
     "express": "^5.2.1",
     "groq-sdk": "^1.1.2",
