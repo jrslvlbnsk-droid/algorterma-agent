@@ -1,15 +1,27 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
+const { Client, GatewayIntentBits } = require('discord.js');
 const Anthropic = require('@anthropic-ai/sdk').default;
 
 const app = express();
 app.use(express.json());
 
+// ── Telegram ──
 const bot = new TelegramBot(process.env.TELEGRAM_TOKEN, {
   polling: { interval: 2000, autoStart: true, params: { timeout: 10 } }
 });
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// ── Discord ──
+const discord = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages
+  ]
+});
+
+const anthropic = new Anthropic({ apiKey: process.env.AI_AGENT_ANTHROPIC });
 
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_USER = 'jrslvlbnsk-droid';
@@ -22,6 +34,7 @@ const projects = {
 const projectState = {};
 const conversationHistory = {};
 
+// ── GitHub helpers ──
 async function getFile(repo, filepath) {
   const url = `https://api.github.com/repos/${GITHUB_USER}/${repo}/contents/${filepath}`;
   const res = await fetch(url, {
@@ -70,15 +83,7 @@ async function getFileAtCommit(repo, filepath, sha) {
   return Buffer.from(data.content, 'base64').toString('utf-8');
 }
 
-function applyPatch(original, patch) {
-  const m = patch.match(/NAJDI:\n([\s\S]*?)\nNAHRAD:\n([\s\S]*?)(\nKONEC|$)/);
-  if (!m) return null;
-  const find = m[1].trim();
-  const replace = m[2].trim();
-  if (!original.includes(find)) return null;
-  return original.replace(find, replace);
-}
-
+// ── Claude ──
 async function callClaude(systemPrompt, history) {
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-20250514',
@@ -89,14 +94,13 @@ async function callClaude(systemPrompt, history) {
   return response.content[0].text;
 }
 
-async function processEdit(chatId, p, fileContent, fileSha, userRequest, retryContext = '') {
+async function processEdit(p, fileContent, userRequest, retryContext = '') {
   const systemPrompt = `Jsi AI agent spravující web ${p.name} (${p.url}). Pracuješ se souborem ${p.file}.
 
 PRAVIDLA:
 - Měň POUZE to co uživatel žádá, nic jiného
-- Vždy vrať přesný patch ve formátu níže
 - Text v NAJDI musí být PŘESNÁ kopie z originálního souboru včetně mezer a odsazení
-- Pokud je změna komplexní, rozděl ji na více NAJDI/NAHRAD bloků za sebou
+- Pokud je změna komplexní, rozděl ji na více NAJDI/NAHRAD bloků
 - NIKDY nevracej celý soubor, pouze změny
 
 ${retryContext ? `PŘEDCHOZÍ POKUS SELHAL: ${retryContext}\nZkus najít přesnější text.` : ''}
@@ -110,7 +114,7 @@ NAHRAD:
 [nový text]
 KONEC
 
-Pro více změn najednou:
+Pro více změn:
 POPIS: [popis]
 NAJDI:
 [první úsek]
@@ -123,14 +127,13 @@ NAHRAD:
 [nová verze]
 KONEC
 
-Pro otázky nebo informace odpověz normálně BEZ formátu NAJDI/NAHRAD.
+Pro otázky odpověz normálně BEZ formátu NAJDI/NAHRAD.
 Odpovídej česky.
 
 AKTUÁLNÍ OBSAH SOUBORU ${p.file}:
 ${fileContent}`;
 
-  const history = [{ role: 'user', content: userRequest }];
-  return await callClaude(systemPrompt, history);
+  return await callClaude(systemPrompt, [{ role: 'user', content: userRequest }]);
 }
 
 function applyAllPatches(original, responseText) {
@@ -154,60 +157,51 @@ function applyAllPatches(original, responseText) {
   return { result, appliedCount, failedPatches };
 }
 
-bot.on('message', async (msg) => {
-  const chatId = msg.chat.id;
-  const text = msg.text;
-  if (!text) return;
-
+// ── Společná logika pro oba boty ──
+async function handleMessage(chatId, text, sendFn) {
   const currentProject = projectState[chatId] || 'algorterma';
   const p = projects[currentProject];
-  if (!conversationHistory[chatId]) conversationHistory[chatId] = [];
 
   if (text === '/start' || text === '/help') {
-    bot.sendMessage(chatId,
-      '👋 Jsem tvůj AI agent s Claude!\n\n' +
-      '📁 *Projekty:*\n' +
+    sendFn('👋 Jsem tvůj AI agent s Claude!\n\n' +
+      '📁 Projekty:\n' +
       '/algorterma — AlgorTerma\n' +
       '/neumimplavat — Neumimplavat\n' +
       '/projekt — aktuální projekt\n\n' +
-      '🕐 *Historie:*\n' +
+      '🕐 Historie:\n' +
       '/history — posledních 5 commitů\n' +
       '/revert abc123 — vrátit soubor na commit\n\n' +
-      'Prostě mi napiš co chceš upravit!',
-      { parse_mode: 'Markdown' }
-    );
+      'Prostě mi napiš co chceš upravit!');
     return;
   }
 
   if (text === '/algorterma') {
     projectState[chatId] = 'algorterma';
-    conversationHistory[chatId] = [];
-    bot.sendMessage(chatId, '✅ Přepnuto na *AlgorTerma*', { parse_mode: 'Markdown' });
+    sendFn('✅ Přepnuto na AlgorTerma');
     return;
   }
 
   if (text === '/neumimplavat') {
     projectState[chatId] = 'neumimplavat';
-    conversationHistory[chatId] = [];
-    bot.sendMessage(chatId, '✅ Přepnuto na *Neumimplavat*', { parse_mode: 'Markdown' });
+    sendFn('✅ Přepnuto na Neumimplavat');
     return;
   }
 
   if (text === '/projekt') {
-    bot.sendMessage(chatId, `📁 Projekt: *${p.name}* (${p.url})\n📄 Soubor: \`${p.file}\``, { parse_mode: 'Markdown' });
+    sendFn(`📁 Projekt: ${p.name} (${p.url})\n📄 Soubor: ${p.file}`);
     return;
   }
 
   if (text === '/history') {
     try {
-      bot.sendMessage(chatId, '⏳ Načítám historii...');
+      sendFn('⏳ Načítám historii...');
       const commits = await getCommits(p.repo, p.file);
       const list = commits.map((c, i) =>
-        `${i + 1}. \`${c.sha.substring(0, 7)}\` — ${c.commit.message}\n    📅 ${new Date(c.commit.author.date).toLocaleString('cs-CZ')}`
+        `${i + 1}. ${c.sha.substring(0, 7)} — ${c.commit.message}\n    📅 ${new Date(c.commit.author.date).toLocaleString('cs-CZ')}`
       ).join('\n\n');
-      bot.sendMessage(chatId, `🕐 *Historie: ${p.file}*\n\n${list}\n\nPro vrácení: /revert [hash]`, { parse_mode: 'Markdown' });
+      sendFn(`🕐 Historie: ${p.file}\n\n${list}\n\nPro vrácení: /revert [hash]`);
     } catch (e) {
-      bot.sendMessage(chatId, `❌ Chyba: ${e.message}`);
+      sendFn(`❌ Chyba: ${e.message}`);
     }
     return;
   }
@@ -215,68 +209,94 @@ bot.on('message', async (msg) => {
   if (text.startsWith('/revert ')) {
     const hash = text.replace('/revert ', '').trim();
     try {
-      bot.sendMessage(chatId, `⏳ Vracím na verzi \`${hash}\`...`, { parse_mode: 'Markdown' });
+      sendFn(`⏳ Vracím na verzi ${hash}...`);
       const oldContent = await getFileAtCommit(p.repo, p.file, hash);
       const current = await getFile(p.repo, p.file);
       await updateFile(p.repo, p.file, oldContent, current.sha, `Revert na ${hash}`);
-      bot.sendMessage(chatId, `✅ Vráceno na verzi \`${hash}\``, { parse_mode: 'Markdown' });
+      sendFn(`✅ Vráceno na verzi ${hash}`);
     } catch (e) {
-      bot.sendMessage(chatId, `❌ Chyba při revertu: ${e.message}`);
+      sendFn(`❌ Chyba při revertu: ${e.message}`);
     }
     return;
   }
 
-  bot.sendMessage(chatId, `⏳ Pracuji na tom... (${p.name})`);
+  sendFn(`⏳ Pracuji na tom... (${p.name})`);
 
   try {
     const { content: fileContent, sha: fileSha } = await getFile(p.repo, p.file);
 
-    // První pokus
-    let responseText = await processEdit(chatId, p, fileContent, fileSha, text);
+    let responseText = await processEdit(p, fileContent, text);
 
     if (responseText.includes('NAJDI:') && responseText.includes('NAHRAD:')) {
       const { result, appliedCount, failedPatches } = applyAllPatches(fileContent, responseText);
-      const popisMatch = responseText.match(/POPIS: (.+)/);
-      const popis = popisMatch ? popisMatch[1] : 'Úprava webu';
+      const popis = responseText.match(/POPIS: (.+)/)?.[1] || 'Úprava webu';
 
       if (appliedCount > 0) {
         await updateFile(p.repo, p.file, result, fileSha, popis);
         const msg = failedPatches.length > 0
-          ? `✅ *Hotovo!*\n\n📝 ${popis}\n⚠️ ${failedPatches.length} změn se nepodařilo aplikovat\n\n🚀 Na GitHubu, Railway nasazuje...`
-          : `✅ *Hotovo!*\n\n📝 ${popis}\n\n🚀 Na GitHubu, Railway nasazuje...`;
-        bot.sendMessage(chatId, msg, { parse_mode: 'Markdown' });
+          ? `✅ Hotovo!\n\n📝 ${popis}\n⚠️ ${failedPatches.length} změn se nepodařilo aplikovat\n\n🚀 Na GitHubu, Railway nasazuje...`
+          : `✅ Hotovo!\n\n📝 ${popis}\n\n🚀 Na GitHubu, Railway nasazuje...`;
+        sendFn(msg);
       } else {
-        // Retry — patch selhal, zkusíme znovu s kontextem
-        bot.sendMessage(chatId, '🔄 Upřesňuji vyhledávání...');
-        responseText = await processEdit(chatId, p, fileContent, fileSha, text, 'Text k nahrazení nebyl nalezen v souboru. Použij kratší a přesnější úsek textu.');
+        sendFn('🔄 Upřesňuji vyhledávání...');
+        responseText = await processEdit(p, fileContent, text, 'Text k nahrazení nebyl nalezen. Použij kratší a přesnější úsek textu.');
 
         if (responseText.includes('NAJDI:') && responseText.includes('NAHRAD:')) {
           const retry = applyAllPatches(fileContent, responseText);
           if (retry.appliedCount > 0) {
             const popis2 = responseText.match(/POPIS: (.+)/)?.[1] || 'Úprava webu';
             await updateFile(p.repo, p.file, retry.result, fileSha, popis2);
-            bot.sendMessage(chatId, `✅ *Hotovo!*\n\n📝 ${popis2}\n\n🚀 Na GitHubu, Railway nasazuje...`, { parse_mode: 'Markdown' });
+            sendFn(`✅ Hotovo!\n\n📝 ${popis2}\n\n🚀 Na GitHubu, Railway nasazuje...`);
           } else {
-            bot.sendMessage(chatId, '⚠️ Nepodařilo se aplikovat změny. Zkus být konkrétnější — napiš přesně který element nebo text chceš změnit.');
+            sendFn('⚠️ Nepodařilo se aplikovat změny. Zkus být konkrétnější.');
           }
         } else {
-          bot.sendMessage(chatId, responseText.substring(0, 4000));
+          sendFn(responseText.substring(0, 2000));
         }
       }
     } else {
-      bot.sendMessage(chatId, responseText.substring(0, 4000));
+      sendFn(responseText.substring(0, 2000));
     }
 
   } catch (err) {
     console.error(err);
     let errMsg = err.message || 'Neznámá chyba';
     if (err.status === 429) errMsg = 'Překročen limit API. Zkus za chvíli.';
-    if (err.status === 401) errMsg = 'Chybný API klíč — zkontroluj ANTHROPIC_API_KEY v Railway.';
-    bot.sendMessage(chatId, `❌ Chyba: ${errMsg}`);
+    if (err.status === 401) errMsg = 'Chybný API klíč.';
+    sendFn(`❌ Chyba: ${errMsg}`);
   }
+}
+
+// ── Telegram handler ──
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text;
+  if (!text) return;
+  await handleMessage(String(chatId), text, (response) => {
+    bot.sendMessage(chatId, response);
+  });
 });
 
-process.on('SIGTERM', () => { bot.stopPolling(); process.exit(0); });
+// ── Discord handler ──
+discord.on('messageCreate', async (msg) => {
+  if (msg.author.bot) return;
+  const text = msg.content;
+  if (!text.startsWith('/') && !msg.mentions.has(discord.user)) return;
+  const cleanText = text.replace(`<@${discord.user?.id}>`, '').trim();
+  if (!cleanText) return;
+
+  await handleMessage(`discord_${msg.author.id}`, cleanText, (response) => {
+    msg.reply(response);
+  });
+});
+
+discord.once('ready', () => {
+  console.log(`Discord bot přihlášen jako ${discord.user?.tag}`);
+});
+
+discord.login(process.env.AI_AGENT_DISCORD);
+
+process.on('SIGTERM', () => { bot.stopPolling(); discord.destroy(); process.exit(0); });
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => { console.log(`Agent server běží na portu ${PORT}`); });

@@ -12,6 +12,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.81.0",
     "@google/generative-ai": "^0.24.1",
+    "discord.js": "^14.26.0",
     "express": "^5.2.1",
     "groq-sdk": "^1.1.2",
     "node-telegram-bot-api": "^0.67.0"
