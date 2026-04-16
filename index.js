@@ -137,23 +137,32 @@ ${fileContent}`;
 }
 
 function applyAllPatches(original, responseText) {
-  const patchRegex = /NAJDI:\n([\s\S]*?)\nNAHRAD:\n([\s\S]*?)\nKONEC/g;
+  // Match NAJDI/NAHRAD blocks; use [ \t]* so trailing spaces on marker lines
+  // don't break the match, and [\s\S]*? for non-greedy multiline content.
+  const patchRegex = /NAJDI:[ \t]*\n([\s\S]*?)\nNAHRAD:[ \t]*\n([\s\S]*?)\nKONEC/g;
   let result = original;
   let match;
   let appliedCount = 0;
   let failedPatches = [];
 
   while ((match = patchRegex.exec(responseText)) !== null) {
-    const find = match[1].trim();
-    const replace = match[2].trim();
+    // Strip only the single leading/trailing newline added by the marker lines
+    // themselves — do NOT call .trim() so internal indentation is preserved.
+    const find = match[1].replace(/^\n/, '').replace(/\n$/, '');
+    const replace = match[2].replace(/^\n/, '').replace(/\n$/, '');
+
     if (result.includes(find)) {
       result = result.replace(find, replace);
       appliedCount++;
+      console.log(`[patch] ✅ Aplikován patch: "${find.substring(0, 60).replace(/\n/g, '↵')}..."`);
     } else {
-      failedPatches.push(find.substring(0, 50) + '...');
+      const preview = find.substring(0, 60).replace(/\n/g, '↵');
+      console.log(`[patch] ❌ Nenalezen text: "${preview}..."`);
+      failedPatches.push(preview + '...');
     }
   }
 
+  console.log(`[patch] Výsledek: ${appliedCount} aplikováno, ${failedPatches.length} selhalo`);
   return { result, appliedCount, failedPatches };
 }
 
